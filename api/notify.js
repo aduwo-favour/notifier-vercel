@@ -107,6 +107,10 @@ module.exports = async (req, res) => {
       if ((recipient.data().blockedUsers || []).includes(callerUsername)) {
         return res.status(200).json({ sent: 0, reason: "sender blocked" });
       }
+      // Per-chat mute: recipient silenced this conversation.
+      if ((recipient.data().mutedChats || []).includes(chatId)) {
+        return res.status(200).json({ sent: 0, reason: "muted" });
+      }
 
       const sent = await sendToTokens(
         recipient.data().fcmTokens || [],
