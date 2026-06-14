@@ -204,6 +204,39 @@ module.exports = async (req, res) => {
       return res.status(200).json({ sent });
     }
 
+    // ---------------- FRIEND REQUEST / ACCEPT (notify one user) ----------------
+    if (type === "friend_request" || type === "friend_accept") {
+      const toUser = (req.body || {}).to;
+      if (!toUser) return res.status(400).json({ error: "Missing recipient" });
+
+      const rSnap = await db
+        .collection("users")
+        .where("username", "==", toUser)
+        .limit(1)
+        .get();
+      if (rSnap.empty) return res.status(404).json({ error: "Recipient not found" });
+      const recipient = rSnap.docs[0];
+
+      // Respect blocks in both directions.
+      if ((recipient.data().blockedUsers || []).includes(callerUsername)) {
+        return res.status(200).json({ sent: 0, reason: "blocked" });
+      }
+
+      const isReq = type === "friend_request";
+      const data = {
+        type,
+        title: isReq ? "Friend request" : "Request accepted",
+        body: isReq
+          ? `${callerUsername} sent you a friend request`
+          : `${callerUsername} accepted your friend request`,
+        sender: callerUsername,
+        icon: "/icon-192.png",
+      };
+
+      const sent = await sendToTokens(recipient.data().fcmTokens || [], data, recipient.ref);
+      return res.status(200).json({ sent });
+    }
+
     return res.status(400).json({ error: "Unknown type" });
   } catch (err) {
     console.error("notify error:", err);
