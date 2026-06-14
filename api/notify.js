@@ -176,10 +176,37 @@ module.exports = async (req, res) => {
       return res.status(200).json({ sent });
     }
 
+    // ---------------- SIGNUP APPROVAL REQUEST (notify all admins) ----------------
+    if (type === "signup") {
+      // Only a pending (unapproved) user may trigger this — blocks abuse/spam.
+      if (callerSnap.data().approved === true) {
+        return res.status(200).json({ sent: 0, reason: "already approved" });
+      }
+
+      const adminsSnap = await db
+        .collection("users")
+        .where("isAdmin", "==", true)
+        .get();
+
+      const data = {
+        type: "signup",
+        title: "New signup request",
+        body: `${callerUsername} requested to join`,
+        icon: "/icon-192.png",
+      };
+
+      let sent = 0;
+      await Promise.all(
+        adminsSnap.docs.map(async (a) => {
+          sent += await sendToTokens(a.data().fcmTokens || [], data, a.ref);
+        })
+      );
+      return res.status(200).json({ sent });
+    }
+
     return res.status(400).json({ error: "Unknown type" });
   } catch (err) {
     console.error("notify error:", err);
     return res.status(500).json({ error: "Send failed" });
   }
 };
-//nortehdhd
