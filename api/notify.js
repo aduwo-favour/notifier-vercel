@@ -70,7 +70,36 @@ async function dispatch({ tokens, message, field, userRef }) {
 //   • NATIVE → must include a `notification` block. A data-only message to a
 //            killed Android app is delivered at low priority and draws nothing
 //            at all, so the user would simply never be told.
+// Notifications on native Android are drawn by the OS from the `notification`
+// block below, BEFORE any of the app's JavaScript runs. That means no
+// client-side check can suppress one. Anything that should stop a notification
+// has to be decided here, on the server.
+//
+//   • muted   — chat id present in the recipient's `mutedChats`
+//   • reading — recipient currently has this very chat open
+function shouldSkip(user, data) {
+  const key = data.communityId || data.chatId;
+  if (!key) return null;
+
+  const muted = Array.isArray(user.mutedChats) ? user.mutedChats : [];
+  if (muted.includes(key)) return "muted";
+
+  // `activeChat` is written by the client while a conversation is on screen and
+  // refreshed periodically. The freshness window means a force-closed app stops
+  // suppressing notifications within a minute rather than forever.
+  const active = user.activeChat;
+  if (active && active.id === key && active.at) {
+    const age = Date.now() - Number(active.at);
+    if (age >= 0 && age < 60000) return "reading";
+  }
+
+  return null;
+}
+
 async function sendToUser({ user, data, userRef }) {
+  const skip = shouldSkip(user, data);
+  if (skip) return 0;
+
   const stringData = {};
   for (const [k, v] of Object.entries(data)) stringData[k] = v == null ? "" : String(v);
 
@@ -94,7 +123,18 @@ async function sendToUser({ user, data, userRef }) {
       userRef,
       message: {
         data: stringData,
-        notification: { title: data.title, body: data.body },
+        // Lock screens are public. Show WHO messaged, never WHAT they said —
+        // the full text is one tap away inside the app. `data` still carries
+        // everything, so in-app handling is unaffected.
+        notification: {
+          title: data.title,
+          body:
+            data.type === "community"
+              ? "New message in " + (data.communityName || "a community")
+              : data.type === "private"
+                ? "sent you a message"
+                : data.body, // friend requests / signups are not message content
+        },
         android: {
           priority: "high",
           notification: {
@@ -237,6 +277,71 @@ module.exports = async (req, res) => {
         userDocs.map(async (u) => {
           if (!u.exists) return;
           sent += await sendToUser({ user: u.data(), data, userRef: u.ref });
+        })
+      );
+      return res.status(200).json({ sent });
+    }
+
+    // ---------------- FRIEND REQUESTS / ACCEPTS ----------------
+    // These were already being sent by the client (private-chats.js, requests.js,
+    // profile.js) but the server had no branch for them, so every one was
+    // silently answered with "Unknown type" and no notification was ever sent.
+    if (type === "friend_request" || type === "friend_accept") {
+      const target = (req.body.to || "").trim();
+      if (!target) return res.status(400).json({ error: "Missing recipient" });
+      if (target === callerUsername) return res.status(200).json({ sent: 0 });
+
+      const tSnap = await db
+        .collection("users")
+        .where("username", "==", target)
+        .limit(1)
+        .get();
+      if (tSnap.empty) return res.status(200).json({ sent: 0 });
+
+      const targetDoc = tSnap.docs[0];
+
+      // Respect blocks in both directions.
+      if ((targetDoc.data().blockedUsers || []).includes(callerUsername)) {
+        return res.status(200).json({ sent: 0, reason: "blocked" });
+      }
+
+      const isRequest = type === "friend_request";
+      const sent = await sendToUser({
+        user: targetDoc.data(),
+        data: {
+          type,
+          title: callerUsername,
+          body: isRequest ? "sent you a friend request" : "accepted your friend request",
+          sender: callerUsername,
+          icon: "/icon-192.png",
+        },
+        userRef: targetDoc.ref,
+      });
+      return res.status(200).json({ sent });
+    }
+
+    // ---------------- NEW SIGNUP (admins only) ----------------
+    if (type === "signup") {
+      const admins = await db
+        .collection("users")
+        .where("isAdmin", "==", true)
+        .get();
+
+      let sent = 0;
+      await Promise.all(
+        admins.docs.map(async (a) => {
+          if (a.id === callerUid) return;
+          sent += await sendToUser({
+            user: a.data(),
+            data: {
+              type: "signup",
+              title: "New signup",
+              body: `${callerUsername} just registered`,
+              sender: callerUsername,
+              icon: "/icon-192.png",
+            },
+            userRef: a.ref,
+          });
         })
       );
       return res.status(200).json({ sent });
