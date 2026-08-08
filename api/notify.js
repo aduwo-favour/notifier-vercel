@@ -8,57 +8,109 @@
 
 const admin = require("firebase-admin");
 
-// Initialize once per warm instance.
+// Initialize once per warm instance. Capture any failure (bad/missing
+// FIREBASE_SERVICE_ACCOUNT) so the GET health check can report it clearly
+// instead of the whole module throwing on load.
+let initError = null;
 if (!admin.apps.length) {
-  admin.initializeApp({
-    credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)),
-  });
+  try {
+    admin.initializeApp({
+      credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)),
+    });
+  } catch (e) {
+    initError = e.message || String(e);
+    console.error("Admin init failed:", initError);
+  }
 }
-const db = admin.firestore();
+const db = admin.apps.length ? admin.firestore() : null;
 
 function truncate(str, n = 120) {
   const s = String(str || "");
   return s.length > n ? s.slice(0, n) + "…" : s;
 }
 
-// Send data-only messages (your service worker builds the notification from data),
-// then prune any permanently-dead tokens from the given user doc.
-async function sendToTokens(tokens, data, userRef) {
+const DEAD_CODES = new Set([
+  "messaging/registration-token-not-registered",
+  "messaging/invalid-registration-token",
+  "messaging/invalid-argument",
+]);
+
+// Core sender. `field` names the Firestore array the tokens came from, so dead
+// ones get pruned from the right place.
+async function dispatch({ tokens, message, field, userRef }) {
   const valid = [...new Set((tokens || []).filter(Boolean))];
   if (valid.length === 0) return 0;
-
-  const stringData = {};
-  for (const [k, v] of Object.entries(data)) stringData[k] = v == null ? "" : String(v);
 
   let sent = 0;
   const dead = [];
   for (let i = 0; i < valid.length; i += 500) {
     const batch = valid.slice(i, i + 500);
-    const res = await admin.messaging().sendEachForMulticast({
-      tokens: batch,
-      data: stringData,
-      webpush: { headers: { Urgency: "high" } },
-    });
+    const res = await admin.messaging().sendEachForMulticast({ tokens: batch, ...message });
     sent += res.successCount;
     res.responses.forEach((r, idx) => {
-      if (!r.success) {
-        const code = (r.error && r.error.code) || "";
-        if (
-          code === "messaging/registration-token-not-registered" ||
-          code === "messaging/invalid-registration-token" ||
-          code === "messaging/invalid-argument"
-        ) {
-          dead.push(batch[idx]);
-        }
+      if (!r.success && DEAD_CODES.has((r.error && r.error.code) || "")) {
+        dead.push(batch[idx]);
       }
     });
   }
   if (dead.length && userRef) {
     await userRef
-      .update({ fcmTokens: admin.firestore.FieldValue.arrayRemove(...dead) })
+      .update({ [field]: admin.firestore.FieldValue.arrayRemove(...dead) })
       .catch(() => {});
   }
   return sent;
+}
+
+// Web and native need genuinely different payloads, so they are sent as two
+// separate messages rather than one multicast:
+//
+//   • WEB  → data-only. firebase-messaging-sw.js draws the notification. A
+//            `notification` block here would make the browser auto-display a
+//            SECOND one, which is the duplicate-notification bug.
+//   • NATIVE → must include a `notification` block. A data-only message to a
+//            killed Android app is delivered at low priority and draws nothing
+//            at all, so the user would simply never be told.
+async function sendToUser({ user, data, userRef }) {
+  const stringData = {};
+  for (const [k, v] of Object.entries(data)) stringData[k] = v == null ? "" : String(v);
+
+  // Groups a conversation's notifications into one stack instead of spamming
+  // the shade with one row per message.
+  const tag = data.chatId || data.communityId || data.type || "chat";
+
+  const [web, native] = await Promise.all([
+    dispatch({
+      tokens: user.fcmTokens || [],
+      field: "fcmTokens",
+      userRef,
+      message: {
+        data: stringData,
+        webpush: { headers: { Urgency: "high" } },
+      },
+    }),
+    dispatch({
+      tokens: user.fcmTokensNative || [],
+      field: "fcmTokensNative",
+      userRef,
+      message: {
+        data: stringData,
+        notification: { title: data.title, body: data.body },
+        android: {
+          priority: "high",
+          notification: {
+            channelId: "chat_messages",
+            tag,
+            sound: "default",
+            defaultVibrateTimings: true,
+            icon: "ic_stat_notify",
+            color: "#6c5ce7",
+          },
+        },
+      },
+    }),
+  ]);
+
+  return web + native;
 }
 
 module.exports = async (req, res) => {
@@ -67,7 +119,25 @@ module.exports = async (req, res) => {
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   if (req.method === "OPTIONS") return res.status(204).end();
+
+  // Health check: open the endpoint URL in a browser to confirm the function
+  // booted, firebase-admin loaded, and the service-account env var parsed.
+  // Never returns any secret value.
+  if (req.method === "GET") {
+    return res.status(200).json({
+      ok: !initError,
+      adminInitialized: admin.apps.length > 0,
+      serviceAccountPresent: Boolean(process.env.FIREBASE_SERVICE_ACCOUNT),
+      initError: initError || null,
+    });
+  }
+
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+
+  // If admin never initialized, every send would fail — say so plainly.
+  if (!db) {
+    return res.status(500).json({ error: "Server not initialized", detail: initError });
+  }
 
   try {
     const { idToken, type, chatId, communityId, body } = req.body || {};
@@ -107,14 +177,10 @@ module.exports = async (req, res) => {
       if ((recipient.data().blockedUsers || []).includes(callerUsername)) {
         return res.status(200).json({ sent: 0, reason: "sender blocked" });
       }
-      // Per-chat mute: recipient silenced this conversation.
-      if ((recipient.data().mutedChats || []).includes(chatId)) {
-        return res.status(200).json({ sent: 0, reason: "muted" });
-      }
 
-      const sent = await sendToTokens(
-        recipient.data().fcmTokens || [],
-        {
+      const sent = await sendToUser({
+        user: recipient.data(),
+        data: {
           type: "private",
           title: callerUsername,
           body: truncate(body),
@@ -122,8 +188,8 @@ module.exports = async (req, res) => {
           sender: callerUsername,
           icon: "/icon-192.png",
         },
-        recipient.ref
-      );
+        userRef: recipient.ref,
+      });
       return res.status(200).json({ sent });
     }
 
@@ -170,70 +236,9 @@ module.exports = async (req, res) => {
       await Promise.all(
         userDocs.map(async (u) => {
           if (!u.exists) return;
-          sent += await sendToTokens(u.data().fcmTokens || [], data, u.ref);
+          sent += await sendToUser({ user: u.data(), data, userRef: u.ref });
         })
       );
-      return res.status(200).json({ sent });
-    }
-
-    // ---------------- SIGNUP APPROVAL REQUEST (notify all admins) ----------------
-    if (type === "signup") {
-      // Only a pending (unapproved) user may trigger this — blocks abuse/spam.
-      if (callerSnap.data().approved === true) {
-        return res.status(200).json({ sent: 0, reason: "already approved" });
-      }
-
-      const adminsSnap = await db
-        .collection("users")
-        .where("isAdmin", "==", true)
-        .get();
-
-      const data = {
-        type: "signup",
-        title: "New signup request",
-        body: `${callerUsername} requested to join`,
-        icon: "/icon-192.png",
-      };
-
-      let sent = 0;
-      await Promise.all(
-        adminsSnap.docs.map(async (a) => {
-          sent += await sendToTokens(a.data().fcmTokens || [], data, a.ref);
-        })
-      );
-      return res.status(200).json({ sent });
-    }
-
-    // ---------------- FRIEND REQUEST / ACCEPT (notify one user) ----------------
-    if (type === "friend_request" || type === "friend_accept") {
-      const toUser = (req.body || {}).to;
-      if (!toUser) return res.status(400).json({ error: "Missing recipient" });
-
-      const rSnap = await db
-        .collection("users")
-        .where("username", "==", toUser)
-        .limit(1)
-        .get();
-      if (rSnap.empty) return res.status(404).json({ error: "Recipient not found" });
-      const recipient = rSnap.docs[0];
-
-      // Respect blocks in both directions.
-      if ((recipient.data().blockedUsers || []).includes(callerUsername)) {
-        return res.status(200).json({ sent: 0, reason: "blocked" });
-      }
-
-      const isReq = type === "friend_request";
-      const data = {
-        type,
-        title: isReq ? "Friend request" : "Request accepted",
-        body: isReq
-          ? `${callerUsername} sent you a friend request`
-          : `${callerUsername} accepted your friend request`,
-        sender: callerUsername,
-        icon: "/icon-192.png",
-      };
-
-      const sent = await sendToTokens(recipient.data().fcmTokens || [], data, recipient.ref);
       return res.status(200).json({ sent });
     }
 
